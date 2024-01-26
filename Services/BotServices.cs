@@ -67,6 +67,11 @@ namespace HappyFarm.Services
             _workersDictionary.TryAdd(device.Id, worker);
         }
 
+        public void Watch(IEnumerable<IPost> posts)
+        {
+            throw new NotImplementedException();
+        }
+
         public async Task Start()
         {
             if (_isStart)
