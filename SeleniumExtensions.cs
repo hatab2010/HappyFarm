@@ -5,7 +5,7 @@ namespace HappyFarm
 {
     public static class SeleniumExtensions
     {
-        public static void EnsureGoToUrl(this IWebDriver driver, Uri uri, int second = 10)
+        public static void EnsureGoToUrl(this IWebDriver driver, Uri uri, int second = 20)
         {
             var timer = Stopwatch.StartNew();
             bool isFirst = true;

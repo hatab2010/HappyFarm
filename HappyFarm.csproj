@@ -36,4 +36,8 @@
     <Folder Include="Interfaces\" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\HappyFarm.Data\HappyFarm.Data.csproj" />
+  </ItemGroup>
+
 </Project>

@@ -1,168 +1,268 @@
-﻿using OpenQA.Selenium;
-using OpenQA.Selenium.Chrome;
-using System.Collections.Concurrent;
-using System.Linq;
-using System.Threading.Tasks;
-using static System.Net.WebRequestMethods;
+﻿using System.Collections.Concurrent;
+using HappyFarm.Data.Models;
+using HappyFarm.JSONs;
+using HappyFarm.Models;
+using HappyFarm.Services.Base;
+using Microsoft.EntityFrameworkCore.Query.Internal;
+using Newtonsoft.Json;
 
 namespace HappyFarm.Services
 {
-    //https://t.me/test_rtest/21
-    public class BotServices : IDisposable
+    public class WokerTask
     {
-        object _lock = new object();
+        public DateTime Created { get; private set; }
+        public IPost Post { get; private set; }
+        public ITpmInterval TpmInterval { get; private set; }
+        public IViewInterval ViewInterval { get; private set; }
 
-        private DeviceServices deviceServices;
-        private ConcurrentDictionary<string, Worker> _workersDictionary = new ConcurrentDictionary<string, Worker>();
-        private List<IPost> _posts = new List<IPost>();
-        private bool _dispoce;
-        private bool _isStart;
-
-        public BotServices(DeviceServices _deviceServices)
+        public WokerTask
+            (
+                ITpmInterval tpmInterval,
+            )
         {
-            _posts.Add(new TelegramPost()
+            Created = DateTime.Now;
+        }
+    }
+
+    public interface IWorkerTaskTicket
+    {
+
+    }
+
+    public class WokerTaskTicket : IWorkerTaskTicket
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+        public DateTime Start { get; set; }
+        public DateTime End { get; set; }
+        public int RequiredViewCount { get; set; }
+        public int ReleaseViewCount { get; set; }
+        public IPost Post { get; set; }
+    }
+
+    public class WorkerTaskServices : ScopeContextBase
+    {
+        private SheduleManager _sheduleManager = new SheduleManager();
+        private object _locker = new object();
+        private WorkerShedule _workerShedule;
+        private IEnumerable<IViewInterval> _viewIntervals;
+        private List<WokerTaskTicket> _WorekerTsks = new List<WokerTaskTicket>();
+
+        public WorkerTaskServices(IServiceProvider provider) : base(provider) 
+        {
+            _sheduleManager.SetTestShedule(); //TODO Мок
+        }
+
+        public void AddToTrack(IPost post)
+        {
+            ScopeContext((context) =>
             {
-                Link = new Uri("https://t.me/test_rtest/21"),
-                Created = DateTime.Now
+                var ctxPost = context.Posts.FirstOrDefault(_ => _.Link == post.Link.ToString());
+                if (ctxPost != null) return;
+
+                var newPost = new Post
+                {
+                    Id = Guid.NewGuid(),
+                    Link = post.Link,
+                    Created = DateTime.Now
+                };
+
+                context.Posts.Add(newPost);
+                context.SaveChanges();
             });
-
-            _posts.Add(new TelegramPost()
-            {
-                Link = new Uri("https://t.me/mainchannelforuserbot/425"),
-                Created = DateTime.Now
-            });
-
-            deviceServices = _deviceServices;
-            deviceServices.Attached += OnDeviceAttached;
-            deviceServices.Detached += OnDeviceDetached;
-
-            deviceServices.PairDevices();
-
-            _ = Task.Run(Start);
         }
-
-        public void AddPost(IPost telegramPost)
-        {
-            lock(_lock)
-                _posts.Add(telegramPost);
-        }
-
-        private void OnDeviceDetached(IDevice device)
-        {
-            var isWorkerExist = _workersDictionary.ContainsKey(device.Id);
-
-            if (isWorkerExist == false) return;
-            Worker worker;
-            _workersDictionary.Remove(device.Id, out worker);
-            worker.Dispose();
-        }
-
-        private void OnDeviceAttached(IDevice device)
-        {
-            var isWorkerExist = _workersDictionary.ContainsKey(device.Id);
-
-            if (isWorkerExist == true) return;
-
-            var worker = new Worker(device);
-            _workersDictionary.TryAdd(device.Id, worker);
-        }
-
-        public void Watch(IEnumerable<IPost> posts)
+        public IEnumerable<IWorkerTaskTicket> GetCurrentTask()
         {
             throw new NotImplementedException();
         }
-
-        public async Task Start()
+        public void SetTpmShedule(IEnumerable<ITpmInterval> tpmIntervals)
         {
-            if (_isStart)
-                return;
-            _isStart = true;
+            lock(_locker)
+                _tpmIntervals = tpmIntervals;
+        }
+        public void SetViewIntervals(IEnumerable<IViewInterval> viewIntervals)
+        {
+            lock (_locker)
+                _viewIntervals = viewIntervals;
+        }
 
-            while (_dispoce == false)
+        private void GenerateWokerTasks(IPost post)
+        {
+            var dateTimeNow = DateTime.Now;
+            var tpmInterval = _sheduleManager.GetCurrentInterval();
+
+            if (tpmInterval == null)
+                return;
+
+            var offset = (dateTimeNow - post.Created).TotalMicroseconds;
+            var intervalOffset = 0L;
+            var startDate = post.Created;
+
+            foreach (var interval in _viewIntervals)
+            {
+                intervalOffset += interval.Duration;
+                if (offset > intervalOffset)
+                    continue;
+
+
+                var endDate = startDate.AddMilliseconds(interval.Duration);
+                ///
+                lock (_locker)                
+                    _WorekerTsks.Add(new WokerTaskTicket
+                    {
+                        Start = startDate,
+                        End = endDate,
+                        Id = Guid.NewGuid(),
+                        Post = post,
+                        ReleaseViewCount = (int)Math.Floor(interval.Power * tpmInterval.TpmCapacity)
+                    });
+                
+
+                startDate = endDate;
+            }
+        }
+    }
+
+    public class BotServices : ScopeContextBase, IDisposable
+    {
+        private object _locker = new object();
+        private BlockingCollection<IPost> _posts = new BlockingCollection<IPost>();
+        private WokerServices _workerServices;
+        private SheduleManager _sheduleManager;
+        private IHostEnvironment _host;
+        private IServiceProvider _provider;
+        
+        private bool _dispocer;
+
+        public BotServices
+            (
+                WokerServices _bot, 
+                IServiceProvider provider,
+                IHostEnvironment host
+            ) : base(provider)
+        {
+            _host = host;
+            _sheduleManager = new SheduleManager();
+            _workerServices = _bot;
+
+            //TODO блок с моками
+            LoadViewShedule();
+            _sheduleManager.SetTestShedule(); //Создаю тестовый график нагрузок
+        }
+
+        public void AddToWatch(IPost post)
+        {
+
+        }
+
+        private IViewInterval GetViewInterval(IPost post)
+        {
+            var offset = (DateTime.Now - post.Created).TotalMicroseconds;
+            IViewInterval result = null;
+            long intervalDuration = 0;
+            foreach (var viewInterval in _viewIntervals)
+            {
+                intervalDuration += viewInterval.Duration;
+                if (offset > intervalDuration)
+                    continue;
+                else
+                    result = viewInterval;
+            };
+
+            return result;
+        }
+
+        private void Produce()
+        {
+            var isProduce = true;
+
+            while (isProduce)
             {
                 try
                 {
-                    List<Task> tasks = new List<Task>();
+                    var interval = _sheduleManager.GetCurrentInterval();
+                    ScopeContext((context) =>
+                    {                        
 
-                    foreach (var worker in _workersDictionary)
-                    {
-                        tasks.Add(worker.Value.WatchPosts(_posts));
-                    }
-
-                    Task.WaitAll(tasks.ToArray());
-
-                    await Task.Delay(10);
+                    });
                 }
-                catch
+                catch (Exception)
                 {
 
+
                 }
 
+                lock(_locker)
+                    isProduce = _dispocer == false;
             }
         }
 
-        public void Dispose()
-        {
-            _dispoce = true;
-        }
-    }
-
-    public class Worker : IDisposable
-    {
-        public IDevice Device { private set; get; }
-
-        private List<IWebDriver> _drivers = new List<IWebDriver>();
-        private ChromeOptions _options = new ChromeOptions();
-        private ChromeDriverService _services = ChromeDriverService.CreateDefaultService();
-
-        public Worker(IDevice device)
-        {         
-            Device = device;
-            _options.AddUserProfilePreference("profile.default_content_setting_values.images", 2);
-            _options.AddArgument($"--proxy-server=127.0.0.1:{Device.TetharingPort}");
-        }
 
         public void Dispose()
         {
-            foreach (var driver in _drivers)
-                driver.Dispose();
+            lock(_locker)
+                _dispocer = true;
         }
 
-        public async Task WatchPosts(IEnumerable<IPost> posts)
+        private void LoadViewShedule()
         {
-            List<Task> watchTasks = new List<Task>();
-
-            Device.SwitchIp();
-            var count = posts.Count() - _drivers.Count;
-
-            if (posts.Count() > _drivers.Count)            
-                foreach (var number in Enumerable.Range(0, posts.Count() - _drivers.Count))                
-                    _drivers.Add(new ChromeDriver(_services, _options));
-                
-
-            foreach (var driver in _drivers)
-                driver.Manage().Cookies.DeleteAllCookies();
-
-            foreach (var index in Enumerable.Range(0,posts.Count()))            
-                watchTasks.Add(Task.Run(()=> 
-                { 
-                    _drivers[index].EnsureGoToUrl(posts.ToArray()[index].Link);
-                    Thread.Sleep(600); //Ожидание валидации просмотра
-                }));
-
-            Task.WaitAll(watchTasks.ToArray());
+            var viewShedulePath = Path.Combine(_host.ContentRootPath, "viewShedule.json");
+            _viewIntervals =  JsonConvert.DeserializeObject<List<IViewInterval>>(File.ReadAllText(viewShedulePath)) ??
+                throw new Exception();
         }
     }
 
-    public interface IPost
+    public class WorkerShedule
     {
-        Uri Link { get; }
-        DateTime Created { get; }
+        public DateTime StartDate { get; set; }
+        public List<TpmInterval> Intervals { get; set; }
     }
 
-    public class TelegramPost : IPost
+    public interface ITpmInterval
     {
-        public Uri Link { get; set; }
-        public DateTime Created { get; set; }
+        int TpmCapacity { get; }
+        long Duration { get; }
+    }
+
+    public class TpmInterval
+    {
+        public int TpmCapacity { get; set; }
+        public long Duration { get; set; }
+    }
+
+    public class ViewInterval
+    {
+        public float Power { get; set; }
+        public long Duration { get; set; }
+    }
+
+    public interface ITaskValidator
+    {
+        Task Validate(ITask post);
+    }
+
+    public interface IWatchTask
+    {
+        public IPost Post { get; set; }
+    }
+
+    public interface ITask
+    {
+
+    }
+
+    public class WatchPostTask : ITask
+    {
+        ITaskValidator _validator;
+        public WatchPostTask(ITaskValidator validator)
+        {
+            _validator = validator;
+        }
+
+        public IPost Post { get; private set; }
+
+        public void Confirm()
+        {
+            _validator.Validate(this);
+        }
     }
 }
